@@ -1,0 +1,41 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Xcode user state
+*.xcuserstate
+*.xcscmblueprint
+xcuserdata/
+*.moved-aside
+
+# Xcode build output
+DerivedData/
+build/
+Build/
+*.ipa
+*.dSYM.zip
+*.dSYM
+
+# Swift Package Manager
+.build/
+.swiftpm/
+Package.resolved
+
+# Playgrounds
+timeline.xctimeline
+playground.xcworkspace/
+
+# CocoaPods / Carthage / SwiftPM checkouts
+Pods/
+Carthage/Build/
+SourcePackages/
+
+# Logs and local env
+*.log
+*.xcresult
+.env
+.env.*
+
+# Generated archives
+*.xcarchive
