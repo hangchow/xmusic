@@ -4,6 +4,14 @@ import MediaPlayer
 import SwiftUI
 import UIKit
 
+struct ScannedAudioFile: Equatable {
+    let url: URL
+    let title: String
+    let relativePath: String
+    let fileExtension: String
+    let cloudDownloadState: CloudDownloadState
+}
+
 @MainActor
 final class PlayerStore: ObservableObject {
     @Published private(set) var songs: [Song]
@@ -30,6 +38,7 @@ final class PlayerStore: ObservableObject {
     private var securityScopedURL: URL?
     private var refreshID = UUID()
     private var nowPlayingArtwork: MPMediaItemArtwork?
+    private var downloadTasks: [String: Task<Void, Never>] = [:]
 
     init(storage: LibraryStorage = LibraryStorage()) {
         self.storage = storage
@@ -39,13 +48,19 @@ final class PlayerStore: ObservableObject {
 
         if let url = storage.resolveFolderBookmark() {
             setFolderURL(url)
+            refreshCachedCloudDownloadStates()
         }
 
         configureAudioSession()
         configureRemoteCommands()
+
+        if folderURL != nil {
+            refreshLibrary()
+        }
     }
 
     deinit {
+        downloadTasks.values.forEach { $0.cancel() }
         MPRemoteCommandCenter.shared().playCommand.removeTarget(nil)
         MPRemoteCommandCenter.shared().pauseCommand.removeTarget(nil)
         MPRemoteCommandCenter.shared().togglePlayPauseCommand.removeTarget(nil)
@@ -139,7 +154,7 @@ final class PlayerStore: ObservableObject {
     }
 
     func toggle(song: Song) {
-        if activeSongID == song.id {
+        if activeSongID == song.id, player != nil {
             isPlaying ? pause() : play()
         } else {
             play(song: song)
@@ -180,11 +195,106 @@ final class PlayerStore: ObservableObject {
             return
         }
 
+        let state = refreshCloudDownloadState(for: song, url: url)
+        if state != .local {
+            downloadThenPlay(song: song, url: url)
+            return
+        }
+
+        startPlayback(song: song, url: url)
+    }
+
+    private func startPlayback(song: Song, url: URL) {
         replacePlayer(with: url)
         activeSongID = song.id
         currentTime = 0
         updateNowPlayingInfo()
         play()
+    }
+
+    private func downloadThenPlay(song: Song, url: URL) {
+        clearPlayer()
+        activeSongID = song.id
+        currentTime = 0
+        isPlaying = false
+        MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
+
+        let initialState = refreshCloudDownloadState(for: song, url: url)
+        if initialState == .local {
+            startPlayback(song: song, url: url)
+            return
+        }
+
+        if downloadTasks[song.id] != nil {
+            return
+        }
+
+        setCloudDownloadState(.downloading, for: song.id)
+
+        if initialState != .downloading {
+            do {
+                try startDownloadingICloudItem(for: song, url: url)
+            } catch {
+                let state = refreshCloudDownloadState(for: song, url: url)
+                alertMessage = state == .local
+                    ? nil
+                    : "无法下载 iCloud 歌曲：\(error.localizedDescription)"
+                if state == .local {
+                    startPlayback(song: song, url: url)
+                }
+                return
+            }
+        }
+
+        downloadTasks[song.id] = Task { [weak self] in
+            var finalState: CloudDownloadState = .downloading
+
+            for _ in 0..<240 {
+                if Task.isCancelled {
+                    return
+                }
+
+                finalState = await MainActor.run {
+                    guard let self else {
+                        return .notDownloaded
+                    }
+                    return self.refreshCloudDownloadState(for: song)
+                }
+
+                if finalState == .local {
+                    break
+                }
+
+                try? await Task.sleep(nanoseconds: 500_000_000)
+            }
+
+            await MainActor.run {
+                guard let self else {
+                    return
+                }
+
+                self.downloadTasks[song.id] = nil
+                finalState = self.refreshCloudDownloadState(for: song)
+
+                guard finalState == .local else {
+                    self.alertMessage = "iCloud 歌曲仍未下载完成，请稍后重试：\(song.title)"
+                    return
+                }
+
+                guard self.activeSongID == song.id else {
+                    return
+                }
+
+                let updatedSong = self.songs.first { $0.id == song.id } ?? song
+                guard let playableURL = self.resolvedURL(for: updatedSong) else {
+                    self.alertMessage = "找不到歌曲文件：\(song.title)"
+                    return
+                }
+
+                self.startPlayback(song: updatedSong, url: playableURL)
+                self.loadDuration(forSongID: song.id, url: playableURL)
+            }
+        }
     }
 
     private func play() {
@@ -208,8 +318,9 @@ final class PlayerStore: ObservableObject {
     }
 
     private func stop() {
-        player?.pause()
-        player = nil
+        downloadTasks.values.forEach { $0.cancel() }
+        downloadTasks.removeAll()
+        clearPlayer()
         activeSongID = nil
         currentTime = 0
         isPlaying = false
@@ -227,12 +338,7 @@ final class PlayerStore: ObservableObject {
     }
 
     private func replacePlayer(with url: URL) {
-        if let timeObserver, let player {
-            player.removeTimeObserver(timeObserver)
-        }
-        if let endedObserver {
-            NotificationCenter.default.removeObserver(endedObserver)
-        }
+        clearPlayer()
 
         let item = AVPlayerItem(url: url)
         let nextPlayer = AVPlayer(playerItem: item)
@@ -259,6 +365,20 @@ final class PlayerStore: ObservableObject {
         }
 
         player = nextPlayer
+    }
+
+    private func clearPlayer() {
+        player?.pause()
+
+        if let timeObserver, let player {
+            player.removeTimeObserver(timeObserver)
+            self.timeObserver = nil
+        }
+        if let endedObserver {
+            NotificationCenter.default.removeObserver(endedObserver)
+            self.endedObserver = nil
+        }
+        player = nil
     }
 
     private func neighborSong(step: Int) -> Song? {
@@ -297,6 +417,32 @@ final class PlayerStore: ObservableObject {
         storage.folderName = url.lastPathComponent
     }
 
+    private func refreshCachedCloudDownloadStates() {
+        var didChange = false
+
+        for index in songs.indices {
+            guard let url = resolvedURL(for: songs[index]) else {
+                continue
+            }
+
+            let state = Self.cloudDownloadState(for: url)
+            if songs[index].cloudDownloadState != state {
+                songs[index].cloudDownloadState = state
+                didChange = true
+            }
+        }
+
+        guard didChange else {
+            return
+        }
+
+        do {
+            try storage.saveSongs(songs)
+        } catch {
+            alertMessage = "无法保存 iCloud 下载状态：\(error.localizedDescription)"
+        }
+    }
+
     private func loadDurations(for songs: [Song], refreshID: UUID) {
         guard songs.isEmpty == false else {
             return
@@ -312,6 +458,11 @@ final class PlayerStore: ObservableObject {
                 }
 
                 guard let url = self.resolvedURL(for: song) else {
+                    continue
+                }
+
+                let downloadState = self.refreshCloudDownloadState(for: song, url: url)
+                guard downloadState == .local else {
                     continue
                 }
 
@@ -341,6 +492,63 @@ final class PlayerStore: ObservableObject {
         }
     }
 
+    private func loadDuration(forSongID songID: String, url: URL) {
+        Task {
+            let duration = await Task.detached(priority: .utility) {
+                await Self.duration(for: url)
+            }.value
+
+            guard
+                duration > 0,
+                let index = self.songs.firstIndex(where: { $0.id == songID })
+            else {
+                return
+            }
+
+            self.songs[index].duration = duration
+            if self.activeSongID == songID {
+                self.updateNowPlayingInfo()
+            }
+
+            do {
+                try self.storage.saveSongs(self.songs)
+            } catch {
+                self.alertMessage = "无法保存歌曲时长：\(error.localizedDescription)"
+            }
+        }
+    }
+
+    private func refreshCloudDownloadState(for song: Song, url: URL) -> CloudDownloadState {
+        let state = Self.cloudDownloadState(for: url)
+        setCloudDownloadState(state, for: song.id)
+        return state
+    }
+
+    private func refreshCloudDownloadState(for song: Song) -> CloudDownloadState {
+        guard let url = resolvedURL(for: song) else {
+            return .local
+        }
+
+        return refreshCloudDownloadState(for: song, url: url)
+    }
+
+    private func setCloudDownloadState(_ state: CloudDownloadState, for songID: String) {
+        guard let index = songs.firstIndex(where: { $0.id == songID }) else {
+            return
+        }
+
+        guard songs[index].cloudDownloadState != state else {
+            return
+        }
+
+        songs[index].cloudDownloadState = state
+        do {
+            try storage.saveSongs(songs)
+        } catch {
+            alertMessage = "无法保存 iCloud 下载状态：\(error.localizedDescription)"
+        }
+    }
+
     private nonisolated static func scanSongs(in folderURL: URL, supportedExtensions: Set<String>) -> [Song] {
         let didStartAccessing = folderURL.startAccessingSecurityScopedResource()
         defer {
@@ -349,20 +557,34 @@ final class PlayerStore: ObservableObject {
             }
         }
 
-        requestDownloadIfNeeded(for: folderURL)
+        let files = scanAudioFiles(in: folderURL, supportedExtensions: supportedExtensions)
+        let uniqueFiles = files.reduce(into: [String: ScannedAudioFile]()) { result, file in
+            guard let existingFile = result[file.relativePath] else {
+                result[file.relativePath] = file
+                return
+            }
 
-        return scanAudioFiles(in: folderURL, supportedExtensions: supportedExtensions).map { url in
+            if existingFile.cloudDownloadState != .local, file.cloudDownloadState == .local {
+                result[file.relativePath] = file
+            }
+        }
+
+        return uniqueFiles.values.map { file in
             Song(
-                title: url.deletingPathExtension().lastPathComponent,
-                relativePath: relativePath(for: url, folderURL: folderURL),
-                fileExtension: url.pathExtension.lowercased(),
-                duration: 0
+                title: file.title,
+                relativePath: file.relativePath,
+                fileExtension: file.fileExtension,
+                duration: 0,
+                cloudDownloadState: file.cloudDownloadState
             )
         }
     }
 
-    private nonisolated static func scanAudioFiles(in folderURL: URL, supportedExtensions: Set<String>) -> [URL] {
-        var coordinatedFiles: [URL] = []
+    private nonisolated static func scanAudioFiles(
+        in folderURL: URL,
+        supportedExtensions: Set<String>
+    ) -> [ScannedAudioFile] {
+        var coordinatedFiles: [ScannedAudioFile] = []
         var coordinationError: NSError?
         let coordinator = NSFileCoordinator(filePresenter: nil)
         coordinator.coordinate(readingItemAt: folderURL, options: [], error: &coordinationError) { coordinatedURL in
@@ -382,15 +604,17 @@ final class PlayerStore: ObservableObject {
     private nonisolated static func scanAudioFilesWithoutCoordination(
         in folderURL: URL,
         supportedExtensions: Set<String>
-    ) -> [URL] {
+    ) -> [ScannedAudioFile] {
         guard let enumerator = FileManager.default.enumerator(
             at: folderURL,
             includingPropertiesForKeys: [
                 .isDirectoryKey,
+                .isHiddenKey,
                 .isUbiquitousItemKey,
-                .ubiquitousItemDownloadingStatusKey
+                .ubiquitousItemDownloadingStatusKey,
+                .ubiquitousItemIsDownloadingKey
             ],
-            options: [.skipsHiddenFiles]
+            options: []
         ) else {
             return []
         }
@@ -400,33 +624,81 @@ final class PlayerStore: ObservableObject {
                 return nil
             }
 
-            let ext = url.pathExtension.lowercased()
-            guard supportedExtensions.contains(ext) else {
+            let resourceValues = try? url.resourceValues(forKeys: [.isDirectoryKey, .isHiddenKey])
+            if resourceValues?.isDirectory == true, resourceValues?.isHidden == true {
+                enumerator.skipDescendants()
                 return nil
             }
 
-            let resourceValues = try? url.resourceValues(forKeys: [.isDirectoryKey])
-            guard resourceValues?.isDirectory != true else {
-                return nil
-            }
-
-            requestDownloadIfNeeded(for: url)
-            return url
+            return scannedAudioFile(for: url, folderURL: folderURL, supportedExtensions: supportedExtensions)
         }
     }
 
-    private nonisolated static func requestDownloadIfNeeded(for url: URL) {
-        let resourceValues = try? url.resourceValues(forKeys: [
-            .isUbiquitousItemKey,
-            .ubiquitousItemDownloadingStatusKey
-        ])
+    nonisolated static func scannedAudioFile(
+        for url: URL,
+        folderURL: URL,
+        supportedExtensions: Set<String>
+    ) -> ScannedAudioFile? {
+        let relativePath = relativePath(for: url, folderURL: folderURL)
+        let placeholderRelativePath = iCloudPlaceholderRelativePath(from: relativePath)
+        let displayRelativePath = placeholderRelativePath ?? relativePath
+        let fileExtension = (displayRelativePath as NSString).pathExtension.lowercased()
 
-        guard resourceValues?.isUbiquitousItem == true else {
-            return
+        guard supportedExtensions.contains(fileExtension) else {
+            return nil
         }
 
-        if resourceValues?.ubiquitousItemDownloadingStatus != .current {
-            try? FileManager.default.startDownloadingUbiquitousItem(at: url)
+        let resourceValues = try? url.resourceValues(forKeys: [.isDirectoryKey, .isHiddenKey])
+        guard resourceValues?.isDirectory != true else {
+            return nil
+        }
+
+        if resourceValues?.isHidden == true, placeholderRelativePath == nil {
+            return nil
+        }
+
+        let fileName = (displayRelativePath as NSString).lastPathComponent
+        let title = (fileName as NSString).deletingPathExtension
+        var cloudDownloadState = cloudDownloadState(for: url)
+        if placeholderRelativePath != nil, cloudDownloadState == .local {
+            cloudDownloadState = .notDownloaded
+        }
+
+        return ScannedAudioFile(
+            url: url,
+            title: title,
+            relativePath: displayRelativePath,
+            fileExtension: fileExtension,
+            cloudDownloadState: cloudDownloadState
+        )
+    }
+
+    private nonisolated static func cloudDownloadState(for url: URL) -> CloudDownloadState {
+        let resourceValues = try? url.resourceValues(forKeys: [
+            .isUbiquitousItemKey,
+            .ubiquitousItemDownloadingStatusKey,
+            .ubiquitousItemIsDownloadingKey
+        ])
+
+        if isICloudPlaceholderURL(url) {
+            return resourceValues?.ubiquitousItemIsDownloading == true ? .downloading : .notDownloaded
+        }
+
+        guard resourceValues?.isUbiquitousItem == true else {
+            return .local
+        }
+
+        if resourceValues?.ubiquitousItemIsDownloading == true {
+            return .downloading
+        }
+
+        switch resourceValues?.ubiquitousItemDownloadingStatus {
+        case .current, .downloaded:
+            return .local
+        case .notDownloaded:
+            return .notDownloaded
+        default:
+            return .local
         }
     }
 
@@ -466,7 +738,89 @@ final class PlayerStore: ObservableObject {
     }
 
     private func resolvedURL(for song: Song) -> URL? {
-        folderURL?.appendingPathComponent(song.relativePath)
+        guard let folderURL else {
+            return nil
+        }
+
+        let url = folderURL.appendingPathComponent(song.relativePath)
+        if FileManager.default.fileExists(atPath: url.path) {
+            return url
+        }
+
+        let placeholderURL = Self.iCloudPlaceholderURL(forRelativePath: song.relativePath, folderURL: folderURL)
+        if FileManager.default.fileExists(atPath: placeholderURL.path) {
+            return placeholderURL
+        }
+
+        return url
+    }
+
+    private func startDownloadingICloudItem(for song: Song, url: URL) throws {
+        var candidates = [url]
+        if let folderURL {
+            let visibleURL = folderURL.appendingPathComponent(song.relativePath)
+            if candidates.contains(visibleURL) == false {
+                candidates.append(visibleURL)
+            }
+        }
+
+        var downloadError: Error?
+        for candidate in candidates {
+            do {
+                try FileManager.default.startDownloadingUbiquitousItem(at: candidate)
+                return
+            } catch {
+                downloadError = error
+            }
+        }
+
+        if let downloadError {
+            throw downloadError
+        }
+    }
+
+    private nonisolated static func iCloudPlaceholderRelativePath(from relativePath: String) -> String? {
+        let directory = (relativePath as NSString).deletingLastPathComponent
+        let fileName = (relativePath as NSString).lastPathComponent
+        let suffix = ".icloud"
+
+        guard fileName.hasPrefix("."), fileName.hasSuffix(suffix) else {
+            return nil
+        }
+
+        let withoutSuffix = String(fileName.dropLast(suffix.count))
+        guard withoutSuffix.count > 1 else {
+            return nil
+        }
+
+        let visibleFileName = String(withoutSuffix.dropFirst())
+        guard visibleFileName.isEmpty == false else {
+            return nil
+        }
+
+        if directory.isEmpty || directory == "." {
+            return visibleFileName
+        }
+
+        return (directory as NSString).appendingPathComponent(visibleFileName)
+    }
+
+    private nonisolated static func iCloudPlaceholderURL(forRelativePath relativePath: String, folderURL: URL) -> URL {
+        let directory = (relativePath as NSString).deletingLastPathComponent
+        let fileName = (relativePath as NSString).lastPathComponent
+        let placeholderFileName = ".\(fileName).icloud"
+
+        if directory.isEmpty || directory == "." {
+            return folderURL.appendingPathComponent(placeholderFileName)
+        }
+
+        return folderURL
+            .appendingPathComponent(directory, isDirectory: true)
+            .appendingPathComponent(placeholderFileName)
+    }
+
+    private nonisolated static func isICloudPlaceholderURL(_ url: URL) -> Bool {
+        iCloudPlaceholderRelativePath(from: url.lastPathComponent) != nil
     }
 
     private func configureAudioSession() {

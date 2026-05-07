@@ -48,12 +48,66 @@ final class ModelStorageTests: XCTestCase {
         XCTAssertEqual(song.id, "Albums/Track.flac")
     }
 
+    func testSongDecodesLegacyPayloadWithoutCloudDownloadState() throws {
+        let data = Data("""
+        {
+          "title": "Legacy",
+          "relativePath": "Legacy.mp3",
+          "fileExtension": "mp3",
+          "duration": 42
+        }
+        """.utf8)
+
+        let song = try JSONDecoder().decode(Song.self, from: data)
+
+        XCTAssertEqual(song.cloudDownloadState, .local)
+    }
+
+    func testScanAudioFileMapsICloudPlaceholderToVisibleSong() throws {
+        let folderURL = temporaryDirectory.appendingPathComponent("Music", isDirectory: true)
+        try FileManager.default.createDirectory(at: folderURL, withIntermediateDirectories: true)
+        let placeholderURL = folderURL.appendingPathComponent(".Cloud Track.mp3.icloud")
+        try Data().write(to: placeholderURL)
+
+        let file = try XCTUnwrap(PlayerStore.scannedAudioFile(
+            for: placeholderURL,
+            folderURL: folderURL,
+            supportedExtensions: ["mp3"]
+        ))
+
+        XCTAssertEqual(file.title, "Cloud Track")
+        XCTAssertEqual(file.relativePath, "Cloud Track.mp3")
+        XCTAssertEqual(file.fileExtension, "mp3")
+        XCTAssertEqual(file.cloudDownloadState, .notDownloaded)
+    }
+
+    func testScanAudioFileSkipsHiddenNonICloudFiles() throws {
+        let folderURL = temporaryDirectory.appendingPathComponent("Music", isDirectory: true)
+        try FileManager.default.createDirectory(at: folderURL, withIntermediateDirectories: true)
+        let hiddenURL = folderURL.appendingPathComponent(".Hidden.mp3")
+        try Data().write(to: hiddenURL)
+
+        let file = PlayerStore.scannedAudioFile(
+            for: hiddenURL,
+            folderURL: folderURL,
+            supportedExtensions: ["mp3"]
+        )
+
+        XCTAssertNil(file)
+    }
+
     func testStoragePersistsPlayModeAndSongs() throws {
         let songsURL = temporaryDirectory.appendingPathComponent("songs.json")
         var storage = LibraryStorage(defaults: defaults, songsURL: songsURL)
         let songs = [
             Song(title: "One", relativePath: "One.mp3", fileExtension: "mp3", duration: 61),
-            Song(title: "Two", relativePath: "Nested/Two.m4a", fileExtension: "m4a", duration: 122)
+            Song(
+                title: "Two",
+                relativePath: "Nested/Two.m4a",
+                fileExtension: "m4a",
+                duration: 122,
+                cloudDownloadState: .notDownloaded
+            )
         ]
 
         storage.playMode = .shuffle

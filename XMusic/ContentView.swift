@@ -193,6 +193,8 @@ private struct SongRow: View {
                         .lineLimit(2)
                         .foregroundStyle(.primary)
 
+                    cloudDownloadIndicator
+
                     Text(song.fileExtension.uppercased())
                         .font(.caption2.weight(.semibold))
                         .foregroundStyle(.secondary)
@@ -209,7 +211,7 @@ private struct SongRow: View {
                     in: 0...max(song.duration, 1),
                     step: 1
                 )
-                .disabled(isActive == false)
+                .disabled(isActive == false || song.cloudDownloadState != .local)
                 .tint(isActive ? .accentColor : .secondary)
 
                 HStack {
@@ -222,6 +224,23 @@ private struct SongRow: View {
             }
         }
         .padding(.vertical, 2)
+    }
+
+    @ViewBuilder
+    private var cloudDownloadIndicator: some View {
+        switch song.cloudDownloadState {
+        case .local:
+            EmptyView()
+        case .notDownloaded:
+            Image(systemName: "icloud.and.arrow.down")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.secondary)
+                .accessibilityLabel("未下载")
+        case .downloading:
+            ProgressView()
+                .controlSize(.small)
+                .accessibilityLabel("正在下载")
+        }
     }
 }
 
