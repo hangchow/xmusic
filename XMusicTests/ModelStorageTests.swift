@@ -69,7 +69,7 @@ final class ModelStorageTests: XCTestCase {
         let folderURL = temporaryDirectory.appendingPathComponent("Music", isDirectory: true)
         try FileManager.default.createDirectory(at: folderURL, withIntermediateDirectories: true)
 
-        var storage = LibraryStorage(defaults: defaults, songsURL: songsURL)
+        let storage = LibraryStorage(defaults: defaults, songsURL: songsURL)
         try storage.saveFolderBookmark(for: folderURL)
 
         XCTAssertEqual(storage.folderName, "Music")

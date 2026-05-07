@@ -1,6 +1,8 @@
 import AVFoundation
 import Foundation
+import MediaPlayer
 import SwiftUI
+import UIKit
 
 @MainActor
 final class PlayerStore: ObservableObject {
@@ -27,6 +29,7 @@ final class PlayerStore: ObservableObject {
     private var endedObserver: NSObjectProtocol?
     private var securityScopedURL: URL?
     private var refreshID = UUID()
+    private var nowPlayingArtwork: MPMediaItemArtwork?
 
     init(storage: LibraryStorage = LibraryStorage()) {
         self.storage = storage
@@ -39,9 +42,19 @@ final class PlayerStore: ObservableObject {
         }
 
         configureAudioSession()
+        configureRemoteCommands()
     }
 
     deinit {
+        MPRemoteCommandCenter.shared().playCommand.removeTarget(nil)
+        MPRemoteCommandCenter.shared().pauseCommand.removeTarget(nil)
+        MPRemoteCommandCenter.shared().togglePlayPauseCommand.removeTarget(nil)
+        MPRemoteCommandCenter.shared().stopCommand.removeTarget(nil)
+        MPRemoteCommandCenter.shared().previousTrackCommand.removeTarget(nil)
+        MPRemoteCommandCenter.shared().nextTrackCommand.removeTarget(nil)
+        MPRemoteCommandCenter.shared().changePlaybackPositionCommand.removeTarget(nil)
+        MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
+
         if let timeObserver, let player {
             player.removeTimeObserver(timeObserver)
         }
@@ -148,6 +161,8 @@ final class PlayerStore: ObservableObject {
 
         let time = CMTime(seconds: max(0, seconds), preferredTimescale: 600)
         player?.seek(to: time, toleranceBefore: .zero, toleranceAfter: .zero)
+        currentTime = max(0, seconds)
+        updateNowPlayingInfo()
     }
 
     func elapsedTime(for song: Song) -> TimeInterval {
@@ -168,17 +183,28 @@ final class PlayerStore: ObservableObject {
         replacePlayer(with: url)
         activeSongID = song.id
         currentTime = 0
+        updateNowPlayingInfo()
         play()
     }
 
     private func play() {
         player?.play()
         isPlaying = player != nil
+        updateNowPlayingPlaybackState()
+    }
+
+    private func playFromRemoteCommand() {
+        if player == nil {
+            play(song: activeSong ?? songs.first)
+        } else if isPlaying == false {
+            play()
+        }
     }
 
     private func pause() {
         player?.pause()
         isPlaying = false
+        updateNowPlayingPlaybackState()
     }
 
     private func stop() {
@@ -187,6 +213,7 @@ final class PlayerStore: ObservableObject {
         activeSongID = nil
         currentTime = 0
         isPlaying = false
+        MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
     }
 
     private func handleSongEnded() {
@@ -217,6 +244,7 @@ final class PlayerStore: ObservableObject {
         ) { [weak self] time in
             Task { @MainActor in
                 self?.currentTime = max(0, time.seconds)
+                self?.updateNowPlayingElapsedTime()
             }
         }
 
@@ -298,6 +326,9 @@ final class PlayerStore: ObservableObject {
 
                 if let index = self.songs.firstIndex(where: { $0.id == song.id }) {
                     self.songs[index].duration = duration
+                    if self.activeSongID == song.id {
+                        self.updateNowPlayingInfo()
+                    }
                 }
             }
 
@@ -445,5 +476,135 @@ final class PlayerStore: ObservableObject {
         } catch {
             alertMessage = "无法启用后台播放会话：\(error.localizedDescription)"
         }
+    }
+
+    private func configureRemoteCommands() {
+        let commandCenter = MPRemoteCommandCenter.shared()
+
+        commandCenter.playCommand.isEnabled = true
+        commandCenter.playCommand.addTarget { [weak self] _ in
+            Task { @MainActor in
+                self?.playFromRemoteCommand()
+            }
+            return .success
+        }
+
+        commandCenter.pauseCommand.isEnabled = true
+        commandCenter.pauseCommand.addTarget { [weak self] _ in
+            Task { @MainActor in
+                self?.pause()
+            }
+            return .success
+        }
+
+        commandCenter.togglePlayPauseCommand.isEnabled = true
+        commandCenter.togglePlayPauseCommand.addTarget { [weak self] _ in
+            Task { @MainActor in
+                self?.toggleMainPlayback()
+            }
+            return .success
+        }
+
+        commandCenter.stopCommand.isEnabled = true
+        commandCenter.stopCommand.addTarget { [weak self] _ in
+            Task { @MainActor in
+                self?.stop()
+            }
+            return .success
+        }
+
+        commandCenter.previousTrackCommand.isEnabled = true
+        commandCenter.previousTrackCommand.addTarget { [weak self] _ in
+            Task { @MainActor in
+                self?.playPrevious()
+            }
+            return .success
+        }
+
+        commandCenter.nextTrackCommand.isEnabled = true
+        commandCenter.nextTrackCommand.addTarget { [weak self] _ in
+            Task { @MainActor in
+                self?.playNext()
+            }
+            return .success
+        }
+
+        commandCenter.changePlaybackPositionCommand.isEnabled = true
+        commandCenter.changePlaybackPositionCommand.addTarget { [weak self] event in
+            guard let event = event as? MPChangePlaybackPositionCommandEvent else {
+                return .commandFailed
+            }
+
+            Task { @MainActor in
+                guard let self, let song = self.activeSong else {
+                    return
+                }
+                self.seek(activeSong: song, to: event.positionTime)
+            }
+            return .success
+        }
+    }
+
+    private func updateNowPlayingInfo() {
+        guard let activeSong else {
+            MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
+            return
+        }
+
+        var info: [String: Any] = [
+            MPMediaItemPropertyTitle: activeSong.title,
+            MPMediaItemPropertyArtist: folderName ?? "XMusic",
+            MPNowPlayingInfoPropertyElapsedPlaybackTime: currentTime,
+            MPNowPlayingInfoPropertyDefaultPlaybackRate: 1.0,
+            MPNowPlayingInfoPropertyPlaybackRate: isPlaying ? 1.0 : 0.0
+        ]
+
+        if activeSong.duration > 0 {
+            info[MPMediaItemPropertyPlaybackDuration] = activeSong.duration
+        }
+
+        if let artwork = lockScreenArtwork() {
+            info[MPMediaItemPropertyArtwork] = artwork
+        }
+
+        MPNowPlayingInfoCenter.default().nowPlayingInfo = info
+        updateNowPlayingPlaybackState()
+    }
+
+    private func updateNowPlayingPlaybackState() {
+        guard var info = MPNowPlayingInfoCenter.default().nowPlayingInfo else {
+            return
+        }
+
+        info[MPNowPlayingInfoPropertyElapsedPlaybackTime] = currentTime
+        info[MPNowPlayingInfoPropertyPlaybackRate] = isPlaying ? 1.0 : 0.0
+        MPNowPlayingInfoCenter.default().nowPlayingInfo = info
+
+        if #available(iOS 13.0, *) {
+            MPNowPlayingInfoCenter.default().playbackState = isPlaying ? .playing : .paused
+        }
+    }
+
+    private func updateNowPlayingElapsedTime() {
+        guard var info = MPNowPlayingInfoCenter.default().nowPlayingInfo else {
+            return
+        }
+
+        info[MPNowPlayingInfoPropertyElapsedPlaybackTime] = currentTime
+        MPNowPlayingInfoCenter.default().nowPlayingInfo = info
+    }
+
+    private func lockScreenArtwork() -> MPMediaItemArtwork? {
+        if let nowPlayingArtwork {
+            return nowPlayingArtwork
+        }
+
+        guard let image = UIImage(named: "LockScreenArtwork") else {
+            return nil
+        }
+
+        let artwork = MPMediaItemArtwork(boundsSize: image.size) { _ in image }
+        nowPlayingArtwork = artwork
+        return artwork
     }
 }
