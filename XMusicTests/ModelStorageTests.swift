@@ -118,6 +118,25 @@ final class ModelStorageTests: XCTestCase {
         XCTAssertEqual(reloadedStorage.loadSongs(), songs)
     }
 
+    func testStoragePersistsAndClampsAppVolume() {
+        let songsURL = temporaryDirectory.appendingPathComponent("songs.json")
+        var storage = LibraryStorage(defaults: defaults, songsURL: songsURL)
+
+        XCTAssertEqual(storage.appVolume, 1)
+
+        storage.appVolume = 0.035
+        XCTAssertEqual(storage.appVolume, 0.035, accuracy: 0.000_001)
+
+        storage.appVolume = -1
+        XCTAssertEqual(storage.appVolume, 0)
+
+        storage.appVolume = 2
+        XCTAssertEqual(storage.appVolume, 1)
+
+        storage.appVolume = .nan
+        XCTAssertEqual(storage.appVolume, 1)
+    }
+
     func testStoragePersistsFolderBookmarkAndDisplayName() throws {
         let songsURL = temporaryDirectory.appendingPathComponent("songs.json")
         let folderURL = temporaryDirectory.appendingPathComponent("Music", isDirectory: true)

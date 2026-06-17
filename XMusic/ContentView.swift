@@ -143,7 +143,43 @@ struct ContentView: View {
         }
         .listStyle(.plain)
         .safeAreaInset(edge: .bottom) {
+            bottomPanel
+        }
+    }
+
+    private var bottomPanel: some View {
+        VStack(spacing: 8) {
+            volumeControl
             footer
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 10)
+        .background(.regularMaterial)
+    }
+
+    private var volumeControl: some View {
+        HStack(spacing: 10) {
+            Image(systemName: store.appVolume == 0 ? "speaker.slash.fill" : "speaker.wave.1.fill")
+                .font(.footnote.weight(.semibold))
+                .foregroundStyle(.secondary)
+                .frame(width: 20)
+                .accessibilityHidden(true)
+
+            Slider(
+                value: Binding(
+                    get: { store.appVolume },
+                    set: { store.setAppVolume($0) }
+                ),
+                in: 0...1,
+                step: 0.005
+            )
+            .accessibilityLabel("应用音量")
+            .accessibilityValue("\(Int((store.appVolume * 100).rounded()))%")
+
+            Text("\(Int((store.appVolume * 100).rounded()))%")
+                .font(.caption.monospacedDigit())
+                .foregroundStyle(.secondary)
+                .frame(width: 38, alignment: .trailing)
         }
     }
 
@@ -156,9 +192,6 @@ struct ContentView: View {
         }
         .font(.footnote)
         .foregroundStyle(.secondary)
-        .padding(.horizontal, 16)
-        .padding(.vertical, 9)
-        .background(.regularMaterial)
     }
 }
 

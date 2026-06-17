@@ -8,6 +8,7 @@ struct LibraryStorage {
         static let playMode = "playMode"
         static let folderBookmark = "folderBookmark"
         static let folderName = "folderName"
+        static let appVolume = "appVolume"
     }
 
     init(defaults: UserDefaults = .standard, songsURL: URL? = nil) {
@@ -38,6 +39,19 @@ struct LibraryStorage {
     var folderName: String? {
         get { defaults.string(forKey: Key.folderName) }
         set { defaults.set(newValue, forKey: Key.folderName) }
+    }
+
+    var appVolume: Double {
+        get {
+            guard defaults.object(forKey: Key.appVolume) != nil else {
+                return 1
+            }
+
+            return Self.clampedVolume(defaults.double(forKey: Key.appVolume))
+        }
+        set {
+            defaults.set(Self.clampedVolume(newValue), forKey: Key.appVolume)
+        }
     }
 
     func loadSongs() -> [Song] {
@@ -92,5 +106,13 @@ struct LibraryStorage {
         } catch {
             return nil
         }
+    }
+
+    private static func clampedVolume(_ volume: Double) -> Double {
+        guard volume.isFinite else {
+            return 1
+        }
+
+        return min(max(volume, 0), 1)
     }
 }

@@ -8,6 +8,7 @@ XMusic is a simple iOS music player written in SwiftUI.
 - Scan and cache FLAC, APE, ALAC, M4A, and MP3 files.
 - Persist the selected folder bookmark, play mode, and last refreshed song list.
 - Play, pause, skip, refresh, and switch between list loop, single loop, and shuffle modes.
+- Adjust and persist in-app playback volume independently from the system volume.
 - Show per-song title, format, progress, elapsed time, and duration.
 
 ## Build

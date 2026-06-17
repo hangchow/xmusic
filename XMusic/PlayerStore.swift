@@ -26,6 +26,7 @@ final class PlayerStore: ObservableObject {
             storage.playMode = playMode
         }
     }
+    @Published private(set) var appVolume: Double
     @Published var alertMessage: String?
 
     let supportedExtensions = ["flac", "ape", "alac", "m4a", "mp3"]
@@ -44,6 +45,7 @@ final class PlayerStore: ObservableObject {
         self.storage = storage
         self.songs = storage.loadSongs()
         self.playMode = storage.playMode
+        self.appVolume = storage.appVolume
         self.folderName = storage.folderName
 
         if let url = storage.resolveFolderBookmark() {
@@ -182,6 +184,13 @@ final class PlayerStore: ObservableObject {
 
     func elapsedTime(for song: Song) -> TimeInterval {
         activeSongID == song.id ? currentTime : 0
+    }
+
+    func setAppVolume(_ volume: Double) {
+        let clampedVolume = Self.clampedVolume(volume)
+        appVolume = clampedVolume
+        storage.appVolume = clampedVolume
+        player?.volume = Float(clampedVolume)
     }
 
     private func play(song: Song?) {
@@ -343,6 +352,7 @@ final class PlayerStore: ObservableObject {
         let item = AVPlayerItem(url: url)
         let nextPlayer = AVPlayer(playerItem: item)
         nextPlayer.actionAtItemEnd = .pause
+        nextPlayer.volume = Float(appVolume)
 
         timeObserver = nextPlayer.addPeriodicTimeObserver(
             forInterval: CMTime(seconds: 0.35, preferredTimescale: 600),
@@ -960,5 +970,13 @@ final class PlayerStore: ObservableObject {
         let artwork = MPMediaItemArtwork(boundsSize: image.size) { _ in image }
         nowPlayingArtwork = artwork
         return artwork
+    }
+
+    private nonisolated static func clampedVolume(_ volume: Double) -> Double {
+        guard volume.isFinite else {
+            return 1
+        }
+
+        return min(max(volume, 0), 1)
     }
 }
