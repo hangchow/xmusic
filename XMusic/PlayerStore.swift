@@ -24,6 +24,9 @@ final class PlayerStore: ObservableObject {
     @Published var playMode: PlayMode {
         didSet {
             storage.playMode = playMode
+            if player != nil {
+                prefetchUpcomingSong()
+            }
         }
     }
     @Published private(set) var appVolume: Double
@@ -36,6 +39,12 @@ final class PlayerStore: ObservableObject {
     private var player: AVPlayer?
     private var timeObserver: Any?
     private var endedObserver: NSObjectProtocol?
+    private var failedObserver: NSObjectProtocol?
+    private var itemStatusObservation: NSKeyValueObservation?
+    private var rateObservation: NSKeyValueObservation?
+    private var playbackToken = 0
+    private var consecutiveFailureCount = 0
+    private var upcomingShuffleSongID: String?
     private var securityScopedURL: URL?
     private var refreshID = UUID()
     private var nowPlayingArtwork: MPMediaItemArtwork?
@@ -78,6 +87,9 @@ final class PlayerStore: ObservableObject {
         if let endedObserver {
             NotificationCenter.default.removeObserver(endedObserver)
         }
+        if let failedObserver {
+            NotificationCenter.default.removeObserver(failedObserver)
+        }
         securityScopedURL?.stopAccessingSecurityScopedResource()
     }
 
@@ -89,13 +101,22 @@ final class PlayerStore: ObservableObject {
     }
 
     func chooseFolder(_ url: URL) {
-        setFolderURL(url)
         do {
             try storage.saveFolderBookmark(for: url)
-            refreshLibrary()
         } catch {
             alertMessage = "无法保存文件夹权限：\(error.localizedDescription)"
+            return
         }
+
+        if url.standardizedFileURL.path != folderURL?.standardizedFileURL.path {
+            // Songs are keyed by relative path, so another folder's list must not be reused.
+            stop()
+            songs = []
+            try? storage.saveSongs(songs)
+        }
+
+        setFolderURL(url)
+        refreshLibrary()
     }
 
     func refreshLibrary() {
@@ -110,19 +131,45 @@ final class PlayerStore: ObservableObject {
         let supportedExtensions = Set(supportedExtensions)
 
         Task {
-            let scannedSongs = await Task.detached(priority: .userInitiated) {
-                Self.scanSongs(in: folderURL, supportedExtensions: supportedExtensions)
+            let scanResult = await Task.detached(priority: .userInitiated) {
+                Result {
+                    try Self.scanSongs(in: folderURL, supportedExtensions: supportedExtensions)
+                }
             }.value
 
             guard self.refreshID == currentRefreshID else {
                 return
             }
 
-            let sortedSongs = scannedSongs.sorted {
-                $0.title.localizedStandardCompare($1.title) == .orderedAscending
+            self.isRefreshing = false
+
+            let scannedSongs: [Song]
+            switch scanResult {
+            case .success(let scanned):
+                scannedSongs = scanned
+            case .failure(let error):
+                // An unreadable folder is not an empty one, so the cached list stays.
+                self.isLoadingDurations = false
+                self.alertMessage = "无法读取文件夹：\(error.localizedDescription)"
+                return
+            }
+
+            let knownDurations = Dictionary(
+                self.songs.map { ($0.id, $0.duration) },
+                uniquingKeysWith: { first, _ in first }
+            )
+            let sortedSongs = scannedSongs.map { scannedSong in
+                var song = scannedSong
+                song.duration = knownDurations[song.id] ?? 0
+                return song
+            }.sorted {
+                let order = $0.title.localizedStandardCompare($1.title)
+                if order == .orderedSame {
+                    return $0.relativePath < $1.relativePath
+                }
+                return order == .orderedAscending
             }
             self.songs = sortedSongs
-            self.isRefreshing = false
 
             do {
                 try self.storage.saveSongs(self.songs)
@@ -138,7 +185,7 @@ final class PlayerStore: ObservableObject {
                 self.stop()
             }
 
-            self.loadDurations(for: sortedSongs, refreshID: currentRefreshID)
+            self.loadDurations(for: sortedSongs.filter { $0.duration <= 0 }, refreshID: currentRefreshID)
         }
     }
 
@@ -193,7 +240,11 @@ final class PlayerStore: ObservableObject {
         player?.volume = Float(clampedVolume)
     }
 
-    private func play(song: Song?) {
+    private func play(song: Song?, afterFailure: Bool = false) {
+        if afterFailure == false {
+            consecutiveFailureCount = 0
+        }
+
         guard let song else {
             alertMessage = "歌曲清单为空，请选择文件夹或刷新"
             return
@@ -201,6 +252,11 @@ final class PlayerStore: ObservableObject {
 
         guard let url = resolvedURL(for: song) else {
             alertMessage = "找不到歌曲文件：\(song.title)"
+            return
+        }
+
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            handlePlaybackFailure(of: song, message: "找不到歌曲文件：\(song.title)")
             return
         }
 
@@ -219,6 +275,97 @@ final class PlayerStore: ObservableObject {
         currentTime = 0
         updateNowPlayingInfo()
         play()
+        prefetchUpcomingSong()
+    }
+
+    // Starts downloading the song that plays next, so a track change in the background
+    // does not have to wait for iCloud while the app has no audio to keep it running.
+    private func prefetchUpcomingSong() {
+        upcomingShuffleSongID = nil
+
+        guard
+            playMode != .singleLoop,
+            let upcomingSong = neighborSong(step: 1),
+            upcomingSong.id != activeSongID
+        else {
+            return
+        }
+
+        if playMode == .shuffle {
+            upcomingShuffleSongID = upcomingSong.id
+        }
+
+        guard let url = resolvedURL(for: upcomingSong) else {
+            return
+        }
+
+        if refreshCloudDownloadState(for: upcomingSong, url: url) == .notDownloaded {
+            try? startDownloadingICloudItem(for: upcomingSong, url: url)
+        }
+    }
+
+    private func handlePlaybackFailure(of song: Song, message: String) {
+        clearPlayer()
+        activeSongID = song.id
+        currentTime = 0
+        isPlaying = false
+        updateNowPlayingInfo()
+        alertMessage = message
+
+        consecutiveFailureCount += 1
+        guard playMode != .singleLoop, consecutiveFailureCount < songs.count else {
+            return
+        }
+
+        // Skip on the next main-actor turn so a run of unplayable songs cannot recurse.
+        Task {
+            guard self.activeSongID == song.id, self.player == nil else {
+                return
+            }
+            self.play(song: self.neighborSong(step: 1), afterFailure: true)
+        }
+    }
+
+    private func handleItemStatusChange(token: Int) {
+        guard token == playbackToken, let item = player?.currentItem else {
+            return
+        }
+
+        switch item.status {
+        case .readyToPlay:
+            consecutiveFailureCount = 0
+            if let activeSongID {
+                applyDuration(item.duration.seconds, toSongID: activeSongID)
+            }
+        case .failed:
+            handleActiveItemFailure(token: token, errorDescription: item.error?.localizedDescription)
+        default:
+            break
+        }
+    }
+
+    private func handleActiveItemFailure(token: Int, errorDescription: String?) {
+        guard token == playbackToken, let song = activeSong else {
+            return
+        }
+
+        let reason = errorDescription.map { "（\($0)）" } ?? ""
+        handlePlaybackFailure(of: song, message: "无法播放：\(song.title)\(reason)")
+    }
+
+    // The system pauses and resumes the player on its own (interruptions, unplugged headphones).
+    private func syncPlayingState(token: Int) {
+        guard token == playbackToken, let player else {
+            return
+        }
+
+        let isPlayerPlaying = player.rate != 0
+        guard isPlaying != isPlayerPlaying else {
+            return
+        }
+
+        isPlaying = isPlayerPlaying
+        updateNowPlayingPlaybackState()
     }
 
     private func downloadThenPlay(song: Song, url: URL) {
@@ -226,7 +373,7 @@ final class PlayerStore: ObservableObject {
         activeSongID = song.id
         currentTime = 0
         isPlaying = false
-        MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
+        updateNowPlayingInfo()
 
         let initialState = refreshCloudDownloadState(for: song, url: url)
         if initialState == .local {
@@ -256,6 +403,12 @@ final class PlayerStore: ObservableObject {
         }
 
         downloadTasks[song.id] = Task { [weak self] in
+            // Keeps the app running while it waits, even when nothing is playing in the background.
+            let backgroundTask = BackgroundTaskAssertion(name: "XMusic.iCloudDownload")
+            defer {
+                backgroundTask.end()
+            }
+
             var finalState: CloudDownloadState = .downloading
 
             for _ in 0..<240 {
@@ -307,6 +460,9 @@ final class PlayerStore: ObservableObject {
     }
 
     private func play() {
+        if player != nil {
+            activateAudioSession()
+        }
         player?.play()
         isPlaying = player != nil
         updateNowPlayingPlaybackState()
@@ -340,7 +496,8 @@ final class PlayerStore: ObservableObject {
         switch playMode {
         case .singleLoop:
             player?.seek(to: .zero)
-            player?.play()
+            currentTime = 0
+            play()
         case .listLoop, .shuffle:
             playNext()
         }
@@ -353,14 +510,18 @@ final class PlayerStore: ObservableObject {
         let nextPlayer = AVPlayer(playerItem: item)
         nextPlayer.actionAtItemEnd = .pause
         nextPlayer.volume = Float(appVolume)
+        let token = playbackToken
 
         timeObserver = nextPlayer.addPeriodicTimeObserver(
             forInterval: CMTime(seconds: 0.35, preferredTimescale: 600),
             queue: .main
         ) { [weak self] time in
             Task { @MainActor in
-                self?.currentTime = max(0, time.seconds)
-                self?.updateNowPlayingElapsedTime()
+                guard let self, self.playbackToken == token else {
+                    return
+                }
+                self.currentTime = max(0, time.seconds)
+                self.updateNowPlayingElapsedTime()
             }
         }
 
@@ -370,7 +531,34 @@ final class PlayerStore: ObservableObject {
             queue: .main
         ) { [weak self] _ in
             Task { @MainActor in
-                self?.handleSongEnded()
+                guard let self, self.playbackToken == token else {
+                    return
+                }
+                self.handleSongEnded()
+            }
+        }
+
+        failedObserver = NotificationCenter.default.addObserver(
+            forName: .AVPlayerItemFailedToPlayToEndTime,
+            object: item,
+            queue: .main
+        ) { [weak self] notification in
+            let error = notification.userInfo?[AVPlayerItemFailedToPlayToEndTimeErrorKey] as? Error
+            let errorDescription = error?.localizedDescription
+            Task { @MainActor in
+                self?.handleActiveItemFailure(token: token, errorDescription: errorDescription)
+            }
+        }
+
+        itemStatusObservation = item.observe(\.status) { [weak self] _, _ in
+            Task { @MainActor in
+                self?.handleItemStatusChange(token: token)
+            }
+        }
+
+        rateObservation = nextPlayer.observe(\.rate) { [weak self] _, _ in
+            Task { @MainActor in
+                self?.syncPlayingState(token: token)
             }
         }
 
@@ -378,6 +566,13 @@ final class PlayerStore: ObservableObject {
     }
 
     private func clearPlayer() {
+        // Callbacks still in flight from the previous player compare against this and drop out.
+        playbackToken += 1
+        itemStatusObservation?.invalidate()
+        itemStatusObservation = nil
+        rateObservation?.invalidate()
+        rateObservation = nil
+
         player?.pause()
 
         if let timeObserver, let player {
@@ -387,6 +582,10 @@ final class PlayerStore: ObservableObject {
         if let endedObserver {
             NotificationCenter.default.removeObserver(endedObserver)
             self.endedObserver = nil
+        }
+        if let failedObserver {
+            NotificationCenter.default.removeObserver(failedObserver)
+            self.failedObserver = nil
         }
         player = nil
     }
@@ -399,6 +598,13 @@ final class PlayerStore: ObservableObject {
         if playMode == .shuffle, step > 0 {
             if songs.count == 1 {
                 return songs[0]
+            }
+            if
+                let upcomingShuffleSongID,
+                upcomingShuffleSongID != activeSongID,
+                let upcomingSong = songs.first(where: { $0.id == upcomingShuffleSongID })
+            {
+                return upcomingSong
             }
             let candidates = songs.filter { $0.id != activeSongID }
             return candidates.randomElement()
@@ -454,16 +660,15 @@ final class PlayerStore: ObservableObject {
     }
 
     private func loadDurations(for songs: [Song], refreshID: UUID) {
+        isLoadingDurations = songs.isEmpty == false
         guard songs.isEmpty == false else {
             return
         }
 
-        isLoadingDurations = true
-
         Task {
             for song in songs {
+                // A newer refresh owns isLoadingDurations from here on.
                 guard self.refreshID == refreshID else {
-                    self.isLoadingDurations = false
                     return
                 }
 
@@ -481,11 +686,10 @@ final class PlayerStore: ObservableObject {
                 }.value
 
                 guard self.refreshID == refreshID else {
-                    self.isLoadingDurations = false
                     return
                 }
 
-                if let index = self.songs.firstIndex(where: { $0.id == song.id }) {
+                if duration > 0, let index = self.songs.firstIndex(where: { $0.id == song.id }) {
                     self.songs[index].duration = duration
                     if self.activeSongID == song.id {
                         self.updateNowPlayingInfo()
@@ -508,23 +712,29 @@ final class PlayerStore: ObservableObject {
                 await Self.duration(for: url)
             }.value
 
-            guard
-                duration > 0,
-                let index = self.songs.firstIndex(where: { $0.id == songID })
-            else {
-                return
-            }
+            self.applyDuration(duration, toSongID: songID)
+        }
+    }
 
-            self.songs[index].duration = duration
-            if self.activeSongID == songID {
-                self.updateNowPlayingInfo()
-            }
+    private func applyDuration(_ duration: TimeInterval, toSongID songID: String) {
+        guard
+            duration.isFinite,
+            duration > 0,
+            let index = songs.firstIndex(where: { $0.id == songID }),
+            abs(songs[index].duration - duration) >= 0.5
+        else {
+            return
+        }
 
-            do {
-                try self.storage.saveSongs(self.songs)
-            } catch {
-                self.alertMessage = "无法保存歌曲时长：\(error.localizedDescription)"
-            }
+        songs[index].duration = duration
+        if activeSongID == songID {
+            updateNowPlayingInfo()
+        }
+
+        do {
+            try storage.saveSongs(songs)
+        } catch {
+            alertMessage = "无法保存歌曲时长：\(error.localizedDescription)"
         }
     }
 
@@ -559,7 +769,10 @@ final class PlayerStore: ObservableObject {
         }
     }
 
-    private nonisolated static func scanSongs(in folderURL: URL, supportedExtensions: Set<String>) -> [Song] {
+    private nonisolated static func scanSongs(
+        in folderURL: URL,
+        supportedExtensions: Set<String>
+    ) throws -> [Song] {
         let didStartAccessing = folderURL.startAccessingSecurityScopedResource()
         defer {
             if didStartAccessing {
@@ -567,7 +780,7 @@ final class PlayerStore: ObservableObject {
             }
         }
 
-        let files = scanAudioFiles(in: folderURL, supportedExtensions: supportedExtensions)
+        let files = try scanAudioFiles(in: folderURL, supportedExtensions: supportedExtensions)
         let uniqueFiles = files.reduce(into: [String: ScannedAudioFile]()) { result, file in
             guard let existingFile = result[file.relativePath] else {
                 result[file.relativePath] = file
@@ -593,28 +806,36 @@ final class PlayerStore: ObservableObject {
     private nonisolated static func scanAudioFiles(
         in folderURL: URL,
         supportedExtensions: Set<String>
-    ) -> [ScannedAudioFile] {
-        var coordinatedFiles: [ScannedAudioFile] = []
+    ) throws -> [ScannedAudioFile] {
+        var coordinatedResult: Result<[ScannedAudioFile], Error>?
         var coordinationError: NSError?
         let coordinator = NSFileCoordinator(filePresenter: nil)
         coordinator.coordinate(readingItemAt: folderURL, options: [], error: &coordinationError) { coordinatedURL in
-            coordinatedFiles = scanAudioFilesWithoutCoordination(
-                in: coordinatedURL,
-                supportedExtensions: supportedExtensions
-            )
+            coordinatedResult = Result {
+                try scanAudioFilesWithoutCoordination(
+                    in: coordinatedURL,
+                    supportedExtensions: supportedExtensions
+                )
+            }
         }
 
-        if coordinatedFiles.isEmpty == false || coordinationError == nil {
+        if
+            case .success(let coordinatedFiles)? = coordinatedResult,
+            coordinatedFiles.isEmpty == false || coordinationError == nil
+        {
             return coordinatedFiles
         }
 
-        return scanAudioFilesWithoutCoordination(in: folderURL, supportedExtensions: supportedExtensions)
+        return try scanAudioFilesWithoutCoordination(in: folderURL, supportedExtensions: supportedExtensions)
     }
 
     private nonisolated static func scanAudioFilesWithoutCoordination(
         in folderURL: URL,
         supportedExtensions: Set<String>
-    ) -> [ScannedAudioFile] {
+    ) throws -> [ScannedAudioFile] {
+        // The enumerator swallows errors, so an unreadable folder would look like an empty one.
+        _ = try FileManager.default.contentsOfDirectory(atPath: folderURL.path)
+
         guard let enumerator = FileManager.default.enumerator(
             at: folderURL,
             includingPropertiesForKeys: [
@@ -626,7 +847,7 @@ final class PlayerStore: ObservableObject {
             ],
             options: []
         ) else {
-            return []
+            throw CocoaError(.fileReadUnknown)
         }
 
         return enumerator.compactMap { item in
@@ -836,6 +1057,14 @@ final class PlayerStore: ObservableObject {
     private func configureAudioSession() {
         do {
             try AVAudioSession.sharedInstance().setCategory(.playback, mode: .default)
+        } catch {
+            alertMessage = "无法启用后台播放会话：\(error.localizedDescription)"
+        }
+    }
+
+    // Activating interrupts other apps' audio, so it waits until there is something to play.
+    private func activateAudioSession() {
+        do {
             try AVAudioSession.sharedInstance().setActive(true)
         } catch {
             alertMessage = "无法启用后台播放会话：\(error.localizedDescription)"
@@ -978,5 +1207,25 @@ final class PlayerStore: ObservableObject {
         }
 
         return min(max(volume, 0), 1)
+    }
+}
+
+@MainActor
+private final class BackgroundTaskAssertion {
+    private var identifier = UIBackgroundTaskIdentifier.invalid
+
+    init(name: String) {
+        identifier = UIApplication.shared.beginBackgroundTask(withName: name) { [weak self] in
+            self?.end()
+        }
+    }
+
+    func end() {
+        guard identifier != .invalid else {
+            return
+        }
+
+        UIApplication.shared.endBackgroundTask(identifier)
+        identifier = .invalid
     }
 }
