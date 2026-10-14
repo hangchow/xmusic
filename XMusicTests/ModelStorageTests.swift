@@ -1,3 +1,4 @@
+import AVFoundation
 import XCTest
 @testable import XMusic
 
@@ -94,6 +95,21 @@ final class ModelStorageTests: XCTestCase {
         )
 
         XCTAssertNil(file)
+    }
+
+    func testReadPermissionErrorDetection() {
+        let noPermission = NSError(domain: NSCocoaErrorDomain, code: NSFileReadNoPermissionError)
+        let wrappedNotPermitted = NSError(
+            domain: AVFoundationErrorDomain,
+            code: AVError.Code.unknown.rawValue,
+            userInfo: [NSUnderlyingErrorKey: NSError(domain: NSPOSIXErrorDomain, code: Int(EPERM))]
+        )
+        let unsupported = NSError(domain: AVFoundationErrorDomain, code: AVError.Code.fileFormatNotRecognized.rawValue)
+
+        XCTAssertTrue(PlayerStore.isReadPermissionError(noPermission))
+        XCTAssertTrue(PlayerStore.isReadPermissionError(wrappedNotPermitted))
+        XCTAssertFalse(PlayerStore.isReadPermissionError(unsupported))
+        XCTAssertFalse(PlayerStore.isReadPermissionError(nil))
     }
 
     func testStoragePersistsPlayModeAndSongs() throws {

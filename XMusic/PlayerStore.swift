@@ -44,6 +44,7 @@ final class PlayerStore: ObservableObject {
     private var rateObservation: NSKeyValueObservation?
     private var playbackToken = 0
     private var consecutiveFailureCount = 0
+    private var permissionRetrySongID: String?
     private var upcomingShuffleSongID: String?
     private var securityScopedURL: URL?
     private var refreshID = UUID()
@@ -244,6 +245,7 @@ final class PlayerStore: ObservableObject {
         if afterFailure == false {
             consecutiveFailureCount = 0
         }
+        permissionRetrySongID = nil
 
         guard let song else {
             alertMessage = "歌曲清单为空，请选择文件夹或刷新"
@@ -338,19 +340,69 @@ final class PlayerStore: ObservableObject {
                 applyDuration(item.duration.seconds, toSongID: activeSongID)
             }
         case .failed:
-            handleActiveItemFailure(token: token, errorDescription: item.error?.localizedDescription)
+            handleActiveItemFailure(token: token, error: item.error)
         default:
             break
         }
     }
 
-    private func handleActiveItemFailure(token: Int, errorDescription: String?) {
+    private func handleActiveItemFailure(token: Int, error: Error?) {
         guard token == playbackToken, let song = activeSong else {
             return
         }
 
-        let reason = errorDescription.map { "（\($0)）" } ?? ""
-        handlePlaybackFailure(of: song, message: "无法播放：\(song.title)\(reason)")
+        // iCloud can refuse reads of a file it has only just downloaded, so wait for it once.
+        if
+            Self.isReadPermissionError(error),
+            permissionRetrySongID != song.id,
+            let url = resolvedURL(for: song)
+        {
+            permissionRetrySongID = song.id
+            retryPlaybackAfterCoordinatedRead(song: song, url: url)
+            return
+        }
+
+        handlePlaybackFailure(of: song, message: "无法播放：\(song.title)\(playbackFailureReason(for: error))")
+    }
+
+    private func retryPlaybackAfterCoordinatedRead(song: Song, url: URL) {
+        clearPlayer()
+        currentTime = 0
+        isPlaying = false
+        updateNowPlayingPlaybackState()
+        let token = playbackToken
+
+        Task {
+            // Keeps the app running while it waits, even when nothing is playing in the background.
+            let backgroundTask = BackgroundTaskAssertion(name: "XMusic.playbackRetry")
+            defer {
+                backgroundTask.end()
+            }
+
+            await Self.waitForCoordinatedRead(of: url, timeout: 10)
+
+            guard self.playbackToken == token, self.activeSongID == song.id else {
+                return
+            }
+            self.startPlayback(song: song, url: url)
+        }
+    }
+
+    private func playbackFailureReason(for error: Error?) -> String {
+        guard let error = error as NSError? else {
+            return ""
+        }
+
+        var codes = ["\(error.domain) \(error.code)"]
+        if let underlyingError = error.userInfo[NSUnderlyingErrorKey] as? NSError {
+            codes.append("\(underlyingError.domain) \(underlyingError.code)")
+        }
+
+        var reason = "\(error.localizedDescription) [\(codes.joined(separator: " / "))]"
+        if Self.isReadPermissionError(error), UIApplication.shared.isProtectedDataAvailable == false {
+            reason += "，设备锁定时系统不允许读取该文件"
+        }
+        return "（\(reason)）"
     }
 
     // The system pauses and resumes the player on its own (interruptions, unplugged headphones).
@@ -544,9 +596,8 @@ final class PlayerStore: ObservableObject {
             queue: .main
         ) { [weak self] notification in
             let error = notification.userInfo?[AVPlayerItemFailedToPlayToEndTimeErrorKey] as? Error
-            let errorDescription = error?.localizedDescription
             Task { @MainActor in
-                self?.handleActiveItemFailure(token: token, errorDescription: errorDescription)
+                self?.handleActiveItemFailure(token: token, error: error)
             }
         }
 
@@ -1052,6 +1103,39 @@ final class PlayerStore: ObservableObject {
 
     private nonisolated static func isICloudPlaceholderURL(_ url: URL) -> Bool {
         iCloudPlaceholderRelativePath(from: url.lastPathComponent) != nil
+    }
+
+    nonisolated static func isReadPermissionError(_ error: Error?) -> Bool {
+        guard let error = error as NSError? else {
+            return false
+        }
+
+        switch (error.domain, error.code) {
+        case (NSCocoaErrorDomain, NSFileReadNoPermissionError),
+             (NSPOSIXErrorDomain, Int(EPERM)),
+             (NSPOSIXErrorDomain, Int(EACCES)):
+            return true
+        default:
+            return isReadPermissionError(error.userInfo[NSUnderlyingErrorKey] as? Error)
+        }
+    }
+
+    // A coordinated read waits until iCloud has finished writing the file, downloading it if needed.
+    private nonisolated static func waitForCoordinatedRead(of url: URL, timeout: TimeInterval) async {
+        let coordinator = NSFileCoordinator(filePresenter: nil)
+        let timeoutTask = Task.detached {
+            try await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
+            coordinator.cancel()
+        }
+        defer {
+            timeoutTask.cancel()
+        }
+
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            coordinator.coordinate(with: [.readingIntent(with: url)], queue: OperationQueue()) { _ in
+                continuation.resume()
+            }
+        }
     }
 
     private func configureAudioSession() {
